@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: auto-filter-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
