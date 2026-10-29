@@ -24,8 +24,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 BOT_USERNAME = os.environ["BOT_USERNAME"].lstrip("@")
 
-# Supports the original MONGO_URI and the three-URI setup used by Farookbot.
-# MONGO_URI remains the first-choice name for backward compatibility.
+# Three MongoDB URLs
 MONGO_URIS = [
     os.environ.get("MONGO_URI") or os.environ.get("DATABASE_URI"),
     os.environ.get("MONGO_URI2") or os.environ.get("DATABASE_URI2"),
@@ -35,19 +34,19 @@ MONGO_URIS = [uri for uri in MONGO_URIS if uri and uri.strip()]
 
 if not MONGO_URIS:
     raise RuntimeError(
-        "Set MONGO_URI (or DATABASE_URI) and optionally MONGO_URI2/MONGO_URI3 "
-        "(or DATABASE_URI2/DATABASE_URI3)."
+        "Set MONGO_URI, MONGO_URI2 and MONGO_URI3."
     )
 
 mongo_clients = [
     MongoClient(uri, serverSelectionTimeoutMS=10000)
     for uri in MONGO_URIS
 ]
+
 file_collections = [
     client["autofilter_bot"]["files"]
     for client in mongo_clients
 ]
-# Kept as an alias for code paths that expect the original collection.
+
 files_collection = file_collections[0]
 
 FILES_PER_PAGE = 10
@@ -55,7 +54,6 @@ MAX_SEARCH_RESULTS = 100
 
 
 def format_file_size(size):
-    """Convert a file size in bytes into a readable label."""
     if not size:
         return "Size N/A"
 
@@ -67,6 +65,7 @@ def format_file_size(size):
         return f"{size / (1024 ** 2):.2f} MB"
     if size >= 1024:
         return f"{size / 1024:.2f} KB"
+
     return f"{size:.0f} B"
 
 
@@ -91,14 +90,17 @@ async def save_channel_file(
         media = message.document
         file_name = media.file_name or "document"
         file_type = "document"
+
     elif message.video:
         media = message.video
         file_name = media.file_name or "video"
         file_type = "video"
+
     elif message.audio:
         media = message.audio
         file_name = media.file_name or "audio"
         file_type = "audio"
+
     elif message.animation:
         media = message.animation
         file_name = media.file_name or "animation"
@@ -111,6 +113,7 @@ async def save_channel_file(
         "channel_id": message.chat_id,
         "message_id": message.message_id,
     }
+
     payload = {
         "file_name": file_name,
         "file_id": media.file_id,
@@ -120,25 +123,37 @@ async def save_channel_file(
         "message_id": message.message_id,
     }
 
-    # If this channel post was already indexed, update it in the same database.
-    # Otherwise, distribute new files to the currently smallest database.
     destination = None
+
+    # Update an existing record in its original database.
     for collection in file_collections:
         if collection.find_one(identity, {"_id": 1}):
             destination = collection
             break
 
+    # Otherwise save to the database with the fewest files.
     if destination is None:
         counts = []
+
         for collection in file_collections:
             try:
                 counts.append(collection.count_documents({}))
             except Exception:
-                logger.exception("Could not count files in a MongoDB database")
+                logger.exception(
+                    "Could not count files in MongoDB"
+                )
                 counts.append(float("inf"))
-        destination = file_collections[counts.index(min(counts))]
 
-    destination.update_one(identity, {"$set": payload}, upsert=True)
+        destination = file_collections[
+            counts.index(min(counts))
+        ]
+
+    destination.update_one(
+        identity,
+        {"$set": payload},
+        upsert=True,
+    )
+
     logger.info(
         "Saved file: %s (%s) in MongoDB database %s",
         file_name,
@@ -148,7 +163,7 @@ async def save_channel_file(
 
 
 # ---------------------------------
-# GROUP SEARCH WITH FILE SIZE
+# GROUP SEARCH
 # ---------------------------------
 
 async def search_files(
@@ -166,32 +181,46 @@ async def search_files(
         return
 
     pattern = re.escape(query)
-
     results = []
+
     for database_index, collection in enumerate(file_collections):
         found = list(
             collection.find(
-                {"file_name": {"$regex": pattern, "$options": "i"}}
+                {
+                    "file_name": {
+                        "$regex": pattern,
+                        "$options": "i",
+                    }
+                }
             )
             .sort("file_name", 1)
             .limit(MAX_SEARCH_RESULTS)
         )
+
         results.extend(
-            (database_index, item) for item in found
+            (database_index, item)
+            for item in found
         )
 
-    results.sort(key=lambda entry: entry[1].get("file_name", "").lower())
+    results.sort(
+        key=lambda entry: entry[1].get(
+            "file_name", ""
+        ).lower()
+    )
+
     results = results[:MAX_SEARCH_RESULTS]
 
     if not results:
-        await message.reply_text(f"❌ No files found for: {query}")
+        await message.reply_text(
+            f"❌ No files found for: {query}"
+        )
         return
 
-    # Include the database index so identical ObjectIds in different databases
-    # cannot point to the wrong file.
     context.user_data["search_results"] = [
-        f"{database_index}:{item['_id']}" for database_index, item in results
+        f"{database_index}:{item['_id']}"
+        for database_index, item in results
     ]
+
     context.user_data["search_query"] = query
 
     await send_search_page(
@@ -201,45 +230,79 @@ async def search_files(
     )
 
 
+# ---------------------------------
+# PAGINATION
+# ---------------------------------
+
 async def send_search_page(
     message,
     context: ContextTypes.DEFAULT_TYPE,
     page: int,
     edit_message=None,
 ):
-    file_ids = context.user_data.get("search_results", [])
-    query = context.user_data.get("search_query", "")
+    file_ids = context.user_data.get(
+        "search_results", []
+    )
+
+    query = context.user_data.get(
+        "search_query", ""
+    )
+
     total_files = len(file_ids)
 
     if not total_files:
         if edit_message:
-            await edit_message.edit_text("❌ No files found.")
+            await edit_message.edit_text(
+                "❌ No files found."
+            )
         else:
-            await message.reply_text("❌ No files found.")
+            await message.reply_text(
+                "❌ No files found."
+            )
         return
 
-    total_pages = (total_files + FILES_PER_PAGE - 1) // FILES_PER_PAGE
-    page = max(0, min(page, total_pages - 1))
+    total_pages = (
+        total_files + FILES_PER_PAGE - 1
+    ) // FILES_PER_PAGE
+
+    page = max(
+        0,
+        min(page, total_pages - 1),
+    )
 
     start_index = page * FILES_PER_PAGE
-    current_ids = file_ids[start_index:start_index + FILES_PER_PAGE]
+
+    current_ids = file_ids[
+        start_index:start_index + FILES_PER_PAGE
+    ]
 
     keyboard = []
 
     for stored_ref in current_ids:
         try:
             if ":" in stored_ref:
-                database_index_text, file_id = stored_ref.split(":", 1)
-                database_index = int(database_index_text)
+                database_index_text, file_id = (
+                    stored_ref.split(":", 1)
+                )
+                database_index = int(
+                    database_index_text
+                )
             else:
-                # Compatibility with search results saved by the original code.
-                database_index, file_id = 0, stored_ref
+                database_index = 0
+                file_id = stored_ref
 
-            if database_index < 0 or database_index >= len(file_collections):
+            if (
+                database_index < 0
+                or database_index >= len(file_collections)
+            ):
                 continue
-            item = file_collections[database_index].find_one(
+
+            item = file_collections[
+                database_index
+            ].find_one(
                 {"_id": ObjectId(file_id)}
             )
+
         except Exception:
             item = None
             file_id = ""
@@ -247,19 +310,32 @@ async def send_search_page(
         if not item:
             continue
 
-        file_name = item.get("file_name", "Unknown File")
-        file_size = format_file_size(item.get("file_size"))
+        file_name = item.get(
+            "file_name", "Unknown File"
+        )
 
-        # Keep the whole button label within Telegram's button text limit.
+        file_size = format_file_size(
+            item.get("file_size")
+        )
+
         prefix = f"📁 {file_size} ➤ "
         available = max(1, 64 - len(prefix))
-        button_text = prefix + file_name[:available]
-        start_parameter = f"db{database_index}_{file_id}"
+
+        button_text = (
+            prefix + file_name[:available]
+        )
+
+        start_parameter = (
+            f"db{database_index + 1}_{file_id}"
+        )
 
         keyboard.append([
             InlineKeyboardButton(
                 button_text,
-                url=f"https://t.me/{BOT_USERNAME}?start={start_parameter}",
+                url=(
+                    f"https://t.me/{BOT_USERNAME}"
+                    f"?start={start_parameter}"
+                ),
             )
         ])
 
@@ -274,7 +350,9 @@ async def send_search_page(
         navigation.append(
             InlineKeyboardButton(
                 "⬅️ BACK",
-                callback_data=f"autofilter_page_{page - 1}",
+                callback_data=(
+                    f"autofilter_page_{page - 1}"
+                ),
             )
         )
 
@@ -282,7 +360,9 @@ async def send_search_page(
         navigation.append(
             InlineKeyboardButton(
                 "NEXT ➜",
-                callback_data=f"autofilter_page_{page + 1}",
+                callback_data=(
+                    f"autofilter_page_{page + 1}"
+                ),
             )
         )
 
@@ -292,12 +372,19 @@ async def send_search_page(
         f"🔎 Search Results: {query}\n\n"
         f"📂 Files Found: {total_files}"
     )
+
     markup = InlineKeyboardMarkup(keyboard)
 
     if edit_message:
-        await edit_message.edit_text(text, reply_markup=markup)
+        await edit_message.edit_text(
+            text,
+            reply_markup=markup,
+        )
     else:
-        await message.reply_text(text, reply_markup=markup)
+        await message.reply_text(
+            text,
+            reply_markup=markup,
+        )
 
 
 async def pagination_callback(
@@ -305,6 +392,7 @@ async def pagination_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     data = query.data or ""
@@ -312,7 +400,11 @@ async def pagination_callback(
     if data == "autofilter_page_info":
         return
 
-    match = re.fullmatch(r"autofilter_page_(\d+)", data)
+    match = re.fullmatch(
+        r"autofilter_page_(\d+)",
+        data,
+    )
+
     if not match:
         return
 
@@ -340,55 +432,92 @@ async def start(
     if not context.args:
         await message.reply_text(
             "👋 Welcome to Auto Filter Bot!\n\n"
-            "🔎 Search a movie in the group to find its files."
+            "🔎 Search a movie in the group "
+            "to find its files."
         )
         return
 
     file_parameter = context.args[0]
+
     database_index = 0
     file_id = file_parameter
 
-    # New deep links include the database number, e.g. db2_<ObjectId>.
-    database_match = re.fullmatch(r"db(\\d+)_([0-9a-fA-F]{24})", file_parameter)
+    # Example: db2_<ObjectId>
+    database_match = re.fullmatch(
+        r"db(\d+)_([0-9a-fA-F]{24})",
+        file_parameter,
+    )
+
     if database_match:
-        database_index = int(database_match.group(1)) - 1
+        database_index = (
+            int(database_match.group(1)) - 1
+        )
         file_id = database_match.group(2)
 
-    if not re.fullmatch(r"[0-9a-fA-F]{24}", file_id):
-        await message.reply_text("❌ Invalid file link.")
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{24}",
+        file_id,
+    ):
+        await message.reply_text(
+            "❌ Invalid file link."
+        )
         return
 
-    if database_index < 0 or database_index >= len(file_collections):
-        await message.reply_text("❌ Invalid database link.")
+    if (
+        database_index < 0
+        or database_index >= len(file_collections)
+    ):
+        await message.reply_text(
+            "❌ Invalid database link."
+        )
         return
 
-    item = file_collections[database_index].find_one({"_id": ObjectId(file_id)})
+    item = file_collections[
+        database_index
+    ].find_one(
+        {"_id": ObjectId(file_id)}
+    )
 
-    # Older links did not include the database number; search all databases.
+    # Support old links without a database number.
     if not item and not database_match:
         for collection in file_collections[1:]:
-            item = collection.find_one({"_id": ObjectId(file_id)})
+            item = collection.find_one(
+                {"_id": ObjectId(file_id)}
+            )
+
             if item:
                 break
 
     if not item:
-        await message.reply_text("❌ File not found in the database.")
+        await message.reply_text(
+            "❌ File not found in the database."
+        )
         return
 
     try:
         file_type = item["file_type"]
         telegram_file_id = item["file_id"]
+
         caption = f"📁 {item['file_name']}"
 
         if file_type == "video":
-            await message.reply_video(video=telegram_file_id, caption=caption)
+            await message.reply_video(
+                video=telegram_file_id,
+                caption=caption,
+            )
+
         elif file_type == "audio":
-            await message.reply_audio(audio=telegram_file_id, caption=caption)
+            await message.reply_audio(
+                audio=telegram_file_id,
+                caption=caption,
+            )
+
         elif file_type == "animation":
             await message.reply_animation(
                 animation=telegram_file_id,
                 caption=caption,
             )
+
         else:
             await message.reply_document(
                 document=telegram_file_id,
@@ -397,8 +526,10 @@ async def start(
 
     except Exception:
         logger.exception("Unable to send file")
+
         await message.reply_text(
-            "❌ Unable to send this file. Please try again later."
+            "❌ Unable to send this file. "
+            "Please try again later."
         )
 
 
@@ -407,12 +538,23 @@ async def start(
 # ---------------------------------
 
 def main():
-    render_url = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
-    port = int(os.environ.get("PORT", "10000"))
+    render_url = os.environ[
+        "RENDER_EXTERNAL_URL"
+    ].rstrip("/")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    port = int(
+        os.environ.get("PORT", "10000")
+    )
 
-    app.add_handler(CommandHandler("start", start))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
 
     app.add_handler(
         CallbackQueryHandler(
@@ -450,7 +592,11 @@ def main():
         port=port,
         url_path=BOT_TOKEN,
         webhook_url=f"{render_url}/{BOT_TOKEN}",
-        allowed_updates=["message", "channel_post", "callback_query"],
+        allowed_updates=[
+            "message",
+            "channel_post",
+            "callback_query",
+        ],
     )
 
 
